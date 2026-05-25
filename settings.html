@@ -4,8 +4,23 @@
         <input data-rs-enabled type="checkbox" class="rounded">
         Follow Rocksmith automatically
     </label>
+    <label class="flex items-center gap-2 text-sm text-slate-200 mb-3">
+        <input data-rs-show-player-controls type="checkbox" class="rounded">
+        Show sync controls in player
+    </label>
+    <label class="flex items-center gap-2 text-sm text-slate-200 mb-3">
+        <input data-rs-resync-cue type="checkbox" class="rounded">
+        Play tone when drift correction occurs
+    </label>
     <label class="block text-xs text-slate-400 mb-1">Global audio offset (milliseconds)</label>
     <input data-rs-offset type="number" step="1"
-        class="w-full rounded border border-slate-600 bg-slate-700 px-3 py-1.5 text-sm text-slate-100">
-    <p class="text-xs text-slate-500 mt-2">Positive plays Slopsmith ahead. Set Rocksmith Song Volume to 0 once so only Slopsmith backing audio is heard.</p>
+        class="w-full mb-3 rounded border border-slate-600 bg-slate-700 px-3 py-1.5 text-sm text-slate-100">
+    <label class="block text-xs text-slate-400 mb-1">Song selection delay (milliseconds)</label>
+    <input data-rs-selection-delay type="number" min="0" step="1"
+        class="w-full mb-3 rounded border border-slate-600 bg-slate-700 px-3 py-1.5 text-sm text-slate-100">
+    <label class="block text-xs text-slate-400 mb-1">Correction threshold (milliseconds)</label>
+    <input data-rs-deadband type="number" min="10" step="1"
+        class="w-full mb-1 rounded border border-slate-600 bg-slate-700 px-3 py-1.5 text-sm text-slate-100">
+    <p class="text-xs text-slate-500 mb-2">Slopsmith seek-resyncs only when it is ahead or behind Rocksmith by more than this amount.</p>
+    <p class="text-xs text-slate-500">Positive offset plays Slopsmith ahead. In Rocksmith, set Song Volume to 0 and turn Audio Exclusivity off so Slopsmith can supply the backing audio.</p>
 </section>

@@ -9,13 +9,23 @@
         hooks.loadingCueTimer = null;
     }
 
-    const defaults = { enabled: true, offsetMs: 0, deadbandMs: 70 };
+    const defaults = {
+        enabled: true,
+        offsetMs: 0,
+        deadbandMs: 70,
+        songSelectionDelayMs: 750,
+        showPlayerControls: true,
+        playResyncCue: false
+    };
     let settings = loadSettings();
     let currentRocksmithSong = '';
     let selectedAudio = '';
     let resolvingSong = false;
     let songReady = false;
     let polling = false;
+    let controlGeneration = 0;
+    let candidateSong = '';
+    let candidateSongSince = 0;
 
     function loadSettings() {
         try {
@@ -23,7 +33,10 @@
             return {
                 enabled: saved.enabled !== false,
                 offsetMs: finiteNumber(saved.offsetMs, defaults.offsetMs),
-                deadbandMs: Math.max(10, finiteNumber(saved.deadbandMs, defaults.deadbandMs))
+                deadbandMs: Math.max(10, finiteNumber(saved.deadbandMs, defaults.deadbandMs)),
+                songSelectionDelayMs: Math.max(0, finiteNumber(saved.songSelectionDelayMs, defaults.songSelectionDelayMs)),
+                showPlayerControls: saved.showPlayerControls !== false,
+                playResyncCue: saved.playResyncCue === true
             };
         } catch (_) {
             return { ...defaults };
@@ -48,7 +61,12 @@
 
     function ensurePlayerSyncControls() {
         const controls = document.getElementById('player-controls');
-        if (!controls || document.getElementById('rs-player-sync-controls')) return;
+        const existing = document.getElementById('rs-player-sync-controls');
+        if (!settings.showPlayerControls) {
+            if (existing) existing.remove();
+            return;
+        }
+        if (!controls || existing) return;
 
         const group = document.createElement('div');
         group.id = 'rs-player-sync-controls';
@@ -92,6 +110,7 @@
             if (input.dataset.bound) return;
             input.dataset.bound = '1';
             input.addEventListener('change', () => {
+                if (settings.enabled !== input.checked) controlGeneration += 1;
                 settings.enabled = input.checked;
                 saveSettings();
                 if (!settings.enabled) {
@@ -99,6 +118,7 @@
                     text('[data-rs-load]', 'Sync disabled');
                 } else {
                     currentRocksmithSong = '';
+                    candidateSong = '';
                 }
             });
         });
@@ -121,6 +141,37 @@
             input.dataset.bound = '1';
             input.addEventListener('change', () => {
                 settings.deadbandMs = Math.max(10, finiteNumber(input.value, defaults.deadbandMs));
+                saveSettings();
+            });
+        });
+        document.querySelectorAll('[data-rs-selection-delay]').forEach((input) => {
+            if (document.activeElement !== input) input.value = String(settings.songSelectionDelayMs);
+            if (input.dataset.bound) return;
+            input.dataset.bound = '1';
+            const updateDelay = () => {
+                const value = Number(input.value);
+                if (!Number.isFinite(value)) return;
+                settings.songSelectionDelayMs = Math.max(0, value);
+                saveSettings();
+            };
+            input.addEventListener('input', updateDelay);
+            input.addEventListener('change', updateDelay);
+        });
+        document.querySelectorAll('[data-rs-show-player-controls]').forEach((input) => {
+            input.checked = settings.showPlayerControls;
+            if (input.dataset.bound) return;
+            input.dataset.bound = '1';
+            input.addEventListener('change', () => {
+                settings.showPlayerControls = input.checked;
+                saveSettings();
+            });
+        });
+        document.querySelectorAll('[data-rs-resync-cue]').forEach((input) => {
+            input.checked = settings.playResyncCue;
+            if (input.dataset.bound) return;
+            input.dataset.bound = '1';
+            input.addEventListener('change', () => {
+                settings.playResyncCue = input.checked;
                 saveSettings();
             });
         });
@@ -185,16 +236,23 @@
         return window.slopsmith?.isPlaying === true;
     }
 
-    async function togglePlayback() {
-        if (typeof window.togglePlay === 'function') {
-            await window.togglePlay();
-            return;
-        }
-        document.getElementById('btn-play')?.click();
+    function mayControl(generation) {
+        return settings.enabled && generation === controlGeneration;
     }
 
-    async function pausePlayback() {
-        if (isPlaybackActive()) await togglePlayback();
+    async function togglePlayback(generation) {
+        if (!mayControl(generation)) return false;
+        if (typeof window.togglePlay === 'function') {
+            await window.togglePlay();
+            return true;
+        }
+        document.getElementById('btn-play')?.click();
+        return true;
+    }
+
+    async function pausePlayback(generation) {
+        if (!mayControl(generation)) return;
+        if (isPlaybackActive()) await togglePlayback(generation);
     }
 
     function cueContext() {
@@ -246,6 +304,13 @@
         ]);
     }
 
+    function playResyncCue() {
+        void playCue([
+            { frequency: 659.25, at: 0, duration: 0.065, gain: 0.035, type: 'sine' },
+            { frequency: 880.00, at: 0.072, duration: 0.085, gain: 0.035, type: 'sine' }
+        ]);
+    }
+
     function startLoadingCues() {
         if (hooks.loadingCueTimer) return;
         playLoadingCue();
@@ -284,17 +349,20 @@
         return finiteNumber(audio.currentTime, 0);
     }
 
-    async function seekPlayback(audio, target) {
+    async function seekPlayback(audio, target, generation) {
+        if (!mayControl(generation)) return false;
         const api = nativeBackingApi();
         if (api) {
             try {
                 await api.seekBacking(target);
-                return;
+                return true;
             } catch (_) {
                 // Fall back to the HTML media transport if native seeking fails.
             }
         }
+        if (!mayControl(generation)) return false;
         audio.currentTime = target;
+        return true;
     }
 
     async function ensureNativeAudio() {
@@ -354,13 +422,16 @@
         return { ready: false, status: 'Buffering backing audio...' };
     }
 
-    async function selectSong(songKey) {
+    async function selectSong(songKey, generation) {
+        if (!mayControl(generation)) return;
         resolvingSong = true;
         try {
-            await pausePlayback();
+            await pausePlayback(generation);
+            if (!mayControl(generation)) return;
             stopLoadingCues(false);
             songReady = false;
             const result = await jsonFetch(`/api/plugins/rocksmith_sync/resolve/${encodeURIComponent(songKey)}`);
+            if (!mayControl(generation)) return;
             const match = result?.match;
             if (!match) {
                 selectedAudio = '';
@@ -374,6 +445,7 @@
             text('[data-rs-load]', 'Opening selected song...');
             startLoadingCues();
             await ensureNativeAudio();
+            if (!mayControl(generation)) return;
             if (typeof window.playSong === 'function') {
                 await window.playSong(encodeURIComponent(match.filename));
             } else {
@@ -389,15 +461,39 @@
     async function synchronize(state) {
         if (!settings.enabled) return;
         if (!state || !state.songKey) {
-            await pausePlayback();
+            candidateSong = '';
+            await pausePlayback(controlGeneration);
             return;
         }
+
+        if (candidateSong !== state.songKey) {
+            candidateSong = state.songKey;
+            candidateSongSince = Date.now();
+            controlGeneration += 1;
+            const generation = controlGeneration;
+            stopLoadingCues(false);
+            if (state.songKey !== currentRocksmithSong) {
+                text('[data-rs-load]', 'Waiting for stable song selection...');
+                await pausePlayback(generation);
+                return;
+            }
+        }
+
+        const generation = controlGeneration;
         const slopsmithSelection = String(window.slopsmith?.currentSong?.filename || '');
         const selectionWasOverridden = songReady && selectedAudio && slopsmithSelection && slopsmithSelection !== selectedAudio;
-        if (state.songKey !== currentRocksmithSong || selectionWasOverridden) {
+        if (state.songKey !== currentRocksmithSong) {
+            const remainingMs = settings.songSelectionDelayMs - (Date.now() - candidateSongSince);
+            if (remainingMs > 0) {
+                text('[data-rs-load]', `Waiting to load (${Math.ceil(remainingMs)} ms)...`);
+                return;
+            }
             currentRocksmithSong = state.songKey;
-            await selectSong(state.songKey);
+            await selectSong(state.songKey, generation);
+        } else if (selectionWasOverridden) {
+            await selectSong(state.songKey, generation);
         }
+        if (!mayControl(generation)) return;
         if (!selectedAudio || resolvingSong) return;
         if (!songReady) {
             const readiness = audioReadiness();
@@ -412,36 +508,41 @@
         const audio = playerAudio();
         if (!audio) return;
         if (!state.inSong) {
-            await pausePlayback();
+            await pausePlayback(generation);
             return;
         }
 
         const target = targetSeconds(state);
         if (!state.playing) {
             const wasPlaying = isPlaybackActive();
-            await pausePlayback();
+            await pausePlayback(generation);
+            if (!mayControl(generation)) return;
             const position = await playbackSeconds(audio);
+            if (!mayControl(generation)) return;
             const driftMs = (position - target) * 1000;
             text('[data-rs-drift]', `${driftMs >= 0 ? '+' : ''}${Math.round(driftMs)} ms`);
             if (wasPlaying || Math.abs(driftMs) > settings.deadbandMs) {
-                await seekPlayback(audio, target);
+                await seekPlayback(audio, target, generation);
             }
             return;
         }
 
         if (!isPlaybackActive()) {
             // Align before starting to avoid an audible burst at the previous pause point.
-            await seekPlayback(audio, target);
+            if (!(await seekPlayback(audio, target, generation))) return;
             text('[data-rs-drift]', '+0 ms');
-            await togglePlayback();
+            await togglePlayback(generation);
             return;
         }
 
         const position = await playbackSeconds(audio);
+        if (!mayControl(generation)) return;
         const driftMs = (position - target) * 1000;
         text('[data-rs-drift]', `${driftMs >= 0 ? '+' : ''}${Math.round(driftMs)} ms`);
         if (Math.abs(driftMs) > settings.deadbandMs) {
-            await seekPlayback(audio, target);
+            if (await seekPlayback(audio, target, generation)) {
+                if (settings.playResyncCue) playResyncCue();
+            }
         }
     }
 
@@ -456,7 +557,7 @@
                 text('[data-rs-song]', '-');
                 text('[data-rs-time]', '-');
                 stopLoadingCues(false);
-                if (settings.enabled) await pausePlayback();
+                if (settings.enabled) await pausePlayback(controlGeneration);
                 return;
             }
             const state = snapshot.state;

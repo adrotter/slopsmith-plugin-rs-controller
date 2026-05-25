@@ -1,4 +1,5 @@
 import tempfile
+import json
 import unittest
 from pathlib import Path
 
@@ -66,6 +67,28 @@ class SongResolverTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match.format, "sloppak")
         self.assertTrue(match.automatic)
+
+    def test_converted_sloppak_matches_source_psarc_dlc_key(self):
+        source = self.touch("cdlc/Pink-Floyd_Have-A-Cigar_v1_p.psarc")
+        output = self.touch("sloppak/Pink-Floyd_Have-A-Cigar_v1.sloppak")
+        jobs = {
+            "jobs": [{
+                "filename": source.relative_to(self.dlc).as_posix(),
+                "output_path": str(output),
+                "state": "done",
+            }]
+        }
+        self.config.mkdir()
+        (self.config / "sloppak_converter_jobs.json").write_text(json.dumps(jobs), encoding="utf-8")
+        resolver = SongResolver(self.dlc, self.config, lambda _: {"floydcigar"})
+        resolver.rescan()
+
+        match = resolver.resolve("FloydCigar")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertTrue(match.automatic)
+        self.assertEqual(match.filename, "sloppak/Pink-Floyd_Have-A-Cigar_v1.sloppak")
 
     def test_manual_mapping_rejects_missing_files(self):
         with self.assertRaises(ValueError):
