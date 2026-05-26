@@ -32,6 +32,17 @@ class RocksmithStateTests(unittest.TestCase):
         self.assertTrue(is_playing("LearnASong_Game"))
         self.assertFalse(is_in_song("MainMenu"))
 
+    def test_riff_repeater_ui_menus_are_paused_in_song_states(self):
+        for menu in (
+            "RiffRepeater",
+            "LearnASong_RiffRepeater",
+            "RiffRepeater_AdvancedSettings",
+            "RiffRepeater_Pause",
+        ):
+            with self.subTest(menu=menu):
+                self.assertTrue(is_in_song(menu))
+                self.assertFalse(is_playing(menu))
+
     def test_known_rsmods_builds_have_offset_tables(self):
         self.assertIn(0x00B13D7C, OFFSETS_BY_CHECKSUM)
         self.assertIn(0x0176EC34, OFFSETS_BY_CHECKSUM)

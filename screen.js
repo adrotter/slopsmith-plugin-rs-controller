@@ -329,53 +329,25 @@
         return Math.max(0, finiteNumber(state.positionSeconds, 0) + settings.offsetMs / 1000);
     }
 
-    function nativeBackingApi() {
-        if (window._juceMode !== true) return null;
-        const api = window.slopsmithDesktop?.audio;
-        return api && typeof api.getBackingPosition === 'function' && typeof api.seekBacking === 'function'
-            ? api
-            : null;
-    }
-
     async function playbackSeconds(audio) {
-        const api = nativeBackingApi();
-        if (api) {
-            try {
-                return finiteNumber(await api.getBackingPosition(), 0);
-            } catch (_) {
-                return 0;
-            }
-        }
+        // Slopsmith shims #audio for desktop backing and sloppak stems.
+        // Reading through it keeps drift measurement on the active transport.
         return finiteNumber(audio.currentTime, 0);
     }
 
     async function seekPlayback(audio, target, generation) {
         if (!mayControl(generation)) return false;
-        const api = nativeBackingApi();
-        if (api) {
+        if (typeof window._audioSeek === 'function') {
             try {
-                await api.seekBacking(target);
-                return true;
+                const result = await window._audioSeek(target, 'rocksmith-sync');
+                return mayControl(generation) && result?.completed !== false;
             } catch (_) {
-                // Fall back to the HTML media transport if native seeking fails.
+                // Fall back to the shimmed media transport for older builds.
             }
         }
         if (!mayControl(generation)) return false;
         audio.currentTime = target;
         return true;
-    }
-
-    async function ensureNativeAudio() {
-        const api = window.slopsmithDesktop?.audio;
-        if (!api || typeof api.isAudioRunning !== 'function') {
-            return false;
-        }
-        try {
-            if (!(await api.isAudioRunning())) await api.startAudio();
-            return (await api.isAudioRunning()) === true;
-        } catch (_) {
-            return false;
-        }
     }
 
     function songInfo() {
@@ -411,7 +383,7 @@
             return { ready: false, status: `Loading ${info.stems.length} stems...` };
         }
 
-        if (nativeBackingApi()) {
+        if (window._juceMode === true) {
             return { ready: true, status: 'Ready (native backing)' };
         }
 
@@ -444,8 +416,6 @@
             text('[data-rs-audio]', `${match.filename} (${match.format})`);
             text('[data-rs-load]', 'Opening selected song...');
             startLoadingCues();
-            await ensureNativeAudio();
-            if (!mayControl(generation)) return;
             if (typeof window.playSong === 'function') {
                 await window.playSong(encodeURIComponent(match.filename));
             } else {

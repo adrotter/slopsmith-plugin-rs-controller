@@ -41,7 +41,8 @@ depend on a companion RSMods DLL.
 
 ## Install
 
-1. Install Slopsmith Desktop and configure its Audio Engine output device.
+1. Install Slopsmith Desktop. Native Audio Engine routing is optional; Rocksmith
+   Sync does not turn it on automatically.
 2. Place this directory at:
 
    ```text
