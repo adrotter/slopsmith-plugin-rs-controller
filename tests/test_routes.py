@@ -90,6 +90,80 @@ class SongResolverTests(unittest.TestCase):
         self.assertTrue(match.automatic)
         self.assertEqual(match.filename, "sloppak/Pink-Floyd_Have-A-Cigar_v1.sloppak")
 
+    def test_psarc_matches_dlc_key_when_filename_differs(self):
+        source = self.touch("cdlc/Pink-Floyd_Have-A-Cigar_v1_p.psarc")
+        resolver = SongResolver(self.dlc, self.config, lambda path: {"floydcigar"} if path == source else set())
+
+        match = resolver.resolve("FloydCigar")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "psarc")
+        self.assertTrue(match.automatic)
+        self.assertEqual(match.filename, "cdlc/Pink-Floyd_Have-A-Cigar_v1_p.psarc")
+
+    def test_persisted_song_index_is_reused_after_restart(self):
+        source = self.touch("cdlc/nonmatching-name_p.psarc")
+        resolver = SongResolver(self.dlc, self.config, lambda path: {"internalkey"} if path == source else set())
+        resolver.rescan()
+
+        index_path = self.config / "rocksmith_sync_song_index.json"
+        self.assertTrue(index_path.is_file())
+
+        def fail_if_reparsed(_):
+            raise AssertionError("persisted song index should avoid reparsing PSARCs")
+
+        restarted = SongResolver(self.dlc, self.config, fail_if_reparsed)
+        match = restarted.resolve("InternalKey")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.filename, "cdlc/nonmatching-name_p.psarc")
+
+    def test_song_index_is_invalidated_when_library_changes(self):
+        self.touch("songs/first_p.psarc")
+        calls = []
+
+        def read_keys(path):
+            calls.append(path)
+            return set()
+
+        resolver = SongResolver(self.dlc, self.config, read_keys)
+        resolver.rescan()
+        initial_calls = len(calls)
+        self.touch("songs/second_p.psarc")
+
+        match = resolver.resolve("second")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.filename, "songs/second_p.psarc")
+        self.assertGreater(len(calls), initial_calls)
+
+    def test_song_index_is_invalidated_when_converter_jobs_change(self):
+        source = self.touch("cdlc/nonmatching-name_p.psarc")
+        output = self.touch("sloppak/nonmatching-name.sloppak")
+        self.config.mkdir()
+        jobs_path = self.config / "sloppak_converter_jobs.json"
+        jobs_path.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+        resolver = SongResolver(self.dlc, self.config, lambda path: {"internalkey"} if path == source else set())
+        resolver.rescan()
+        jobs_path.write_text(
+            json.dumps(
+                {
+                    "jobs": [{
+                        "filename": source.relative_to(self.dlc).as_posix(),
+                        "output_path": str(output),
+                        "state": "done",
+                    }]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        match = resolver.resolve("InternalKey")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "sloppak/nonmatching-name.sloppak")
+
     def test_manual_mapping_rejects_missing_files(self):
         with self.assertRaises(ValueError):
             self.resolver.set_mapping("missing", "not-there.sloppak")

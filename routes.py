@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -13,6 +14,7 @@ from typing import Any
 from rocksmith_reader import RocksmithReader
 
 PLUGIN_ID = "rocksmith_sync"
+SONG_INDEX_VERSION = 1
 
 
 def _key(value: str) -> str:
@@ -80,11 +82,14 @@ class SongResolver:
     ) -> None:
         self.dlc_dir = dlc_dir.resolve()
         self.config_path = config_dir / f"{PLUGIN_ID}.json"
+        self.song_index_path = config_dir / f"{PLUGIN_ID}_song_index.json"
         self.converter_jobs_path = config_dir / "sloppak_converter_jobs.json"
         self._dlc_key_reader = dlc_key_reader or _read_psarc_dlc_keys
         self._lock = threading.Lock()
-        self._files: list[Path] | None = None
-        self._converted_sloppaks: dict[str, str] = {}
+        self._refresh_lock = threading.Lock()
+        self._song_index: dict[str, SongMatch] | None = None
+        self._library_fingerprint: str | None = None
+        self._file_count = 0
         self._mappings = self._read_mappings()
 
     def _read_mappings(self) -> dict[str, str]:
@@ -103,13 +108,16 @@ class SongResolver:
         self.config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
     def _path_in_dlc(self, value: str) -> Path | None:
-        candidate = Path(value)
-        resolved = (candidate if candidate.is_absolute() else self.dlc_dir / candidate).resolve()
+        try:
+            candidate = Path(value)
+            resolved = (candidate if candidate.is_absolute() else self.dlc_dir / candidate).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
         if resolved == self.dlc_dir or self.dlc_dir in resolved.parents:
             return resolved
         return None
 
-    def _read_converted_sloppaks(self) -> dict[str, str]:
+    def _read_converted_sloppaks(self, read_keys: Callable[[Path], set[str]]) -> dict[str, str]:
         try:
             raw = json.loads(self.converter_jobs_path.read_text(encoding="utf-8"))
             jobs = raw.get("jobs", []) if isinstance(raw, dict) else []
@@ -132,24 +140,147 @@ class SongResolver:
             ):
                 continue
             relative_output = output.relative_to(self.dlc_dir).as_posix()
-            for dlc_key in self._dlc_key_reader(source):
+            for dlc_key in read_keys(source):
                 matches.setdefault(dlc_key, relative_output)
         return matches
 
-    def rescan(self) -> int:
+    def _library_snapshot(self) -> tuple[list[Path], str]:
         files: list[Path] = []
+        inventory: list[dict[str, Any]] = []
         if self.dlc_dir.exists():
-            for root, _, names in os.walk(self.dlc_dir):
+            for root, dirs, names in os.walk(self.dlc_dir):
+                dirs.sort()
                 root_path = Path(root)
-                for name in names:
+                for name in sorted(names):
                     path = root_path / name
-                    if path.suffix.lower() in {".sloppak", ".psarc"}:
-                        files.append(path)
-        converted_sloppaks = self._read_converted_sloppaks()
-        with self._lock:
-            self._files = files
-            self._converted_sloppaks = converted_sloppaks
-        return len(files)
+                    if path.suffix.lower() not in {".sloppak", ".psarc"}:
+                        continue
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    files.append(path)
+                    inventory.append(
+                        {
+                            "path": path.relative_to(self.dlc_dir).as_posix(),
+                            "size": stat.st_size,
+                            "mtimeNs": stat.st_mtime_ns,
+                        }
+                    )
+        try:
+            converter_jobs_hash = hashlib.sha256(self.converter_jobs_path.read_bytes()).hexdigest()
+        except OSError:
+            converter_jobs_hash = None
+        payload = {
+            "version": SONG_INDEX_VERSION,
+            "files": inventory,
+            "converterJobs": converter_jobs_hash,
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return files, hashlib.sha256(encoded).hexdigest()
+
+    def _read_song_index(self, fingerprint: str) -> dict[str, SongMatch] | None:
+        try:
+            raw = json.loads(self.song_index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if (
+            not isinstance(raw, dict)
+            or raw.get("version") != SONG_INDEX_VERSION
+            or raw.get("libraryFingerprint") != fingerprint
+            or not isinstance(raw.get("songs"), dict)
+        ):
+            return None
+
+        index: dict[str, SongMatch] = {}
+        for lookup, value in raw["songs"].items():
+            if not isinstance(lookup, str) or _key(lookup) != lookup or not isinstance(value, dict):
+                return None
+            filename = value.get("filename")
+            package_format = value.get("format")
+            path = self._path_in_dlc(filename) if isinstance(filename, str) else None
+            if (
+                not path
+                or package_format not in {"sloppak", "psarc"}
+                or path.suffix.lower() != f".{package_format}"
+                or not path.is_file()
+            ):
+                return None
+            index[lookup] = SongMatch(filename, package_format, True)
+        return index
+
+    def _write_song_index(self, fingerprint: str, index: dict[str, SongMatch]) -> None:
+        self.song_index_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": SONG_INDEX_VERSION,
+            "libraryFingerprint": fingerprint,
+            "songs": {
+                lookup: {"filename": match.filename, "format": match.format}
+                for lookup, match in sorted(index.items())
+            },
+        }
+        temporary_path = self.song_index_path.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary_path, self.song_index_path)
+
+    def _build_song_index(self, files: list[Path]) -> dict[str, SongMatch]:
+        index: dict[str, SongMatch] = {}
+        psarc_keys: dict[Path, set[str]] = {}
+
+        def read_keys(path: Path) -> set[str]:
+            resolved = path.resolve()
+            if resolved not in psarc_keys:
+                psarc_keys[resolved] = {_key(value) for value in self._dlc_key_reader(resolved) if _key(value)}
+            return psarc_keys[resolved]
+
+        def add(lookup: str, filename: str, package_format: str) -> None:
+            normalized = _key(lookup)
+            if normalized:
+                index.setdefault(normalized, SongMatch(filename, package_format, True))
+
+        converted_sloppaks = self._read_converted_sloppaks(read_keys)
+        for lookup, filename in sorted(converted_sloppaks.items()):
+            add(lookup, filename, "sloppak")
+
+        sloppaks = sorted(
+            (path for path in files if path.suffix.lower() == ".sloppak"),
+            key=lambda path: path.relative_to(self.dlc_dir).as_posix().lower(),
+        )
+        for path in sloppaks:
+            add(_stem_key(path), path.relative_to(self.dlc_dir).as_posix(), "sloppak")
+
+        psarcs = sorted(
+            (path for path in files if path.suffix.lower() == ".psarc"),
+            key=lambda path: (_psarc_rank(path), path.relative_to(self.dlc_dir).as_posix().lower()),
+        )
+        for path in psarcs:
+            filename = path.relative_to(self.dlc_dir).as_posix()
+            for lookup in sorted(read_keys(path)):
+                add(lookup, filename, "psarc")
+            add(_stem_key(path), filename, "psarc")
+        return index
+
+    def _refresh_song_index(self, force: bool = False) -> int:
+        with self._refresh_lock:
+            files, fingerprint = self._library_snapshot()
+            with self._lock:
+                if not force and self._song_index is not None and self._library_fingerprint == fingerprint:
+                    return self._file_count
+            index = None if force else self._read_song_index(fingerprint)
+            if index is None:
+                index = self._build_song_index(files)
+                try:
+                    self._write_song_index(fingerprint, index)
+                except OSError:
+                    pass
+            with self._lock:
+                self._song_index = index
+                self._library_fingerprint = fingerprint
+                self._file_count = len(files)
+            return len(files)
+
+    def rescan(self) -> int:
+        return self._refresh_song_index(force=True)
 
     def list_mappings(self) -> dict[str, str]:
         with self._lock:
@@ -171,54 +302,37 @@ class SongResolver:
                 self._mappings.pop(map_key, None)
             self._write_mappings()
 
-    def _resolve_scanned(
-        self,
-        lookup: str,
-        manual: str | None,
-        files: list[Path],
-        converted_sloppaks: dict[str, str],
-    ) -> SongMatch | None:
-        manual_path = (self.dlc_dir / manual).resolve() if manual else None
-        if manual_path and manual_path.is_file() and manual_path.suffix.lower() == ".sloppak":
-            return SongMatch(manual, "sloppak", False)
-        converted = converted_sloppaks.get(lookup)
-        converted_path = (self.dlc_dir / converted).resolve() if converted else None
-        if converted_path and converted_path.is_file() and converted_path.suffix.lower() == ".sloppak":
-            return SongMatch(converted, "sloppak", True)
-        matching = [path for path in files if _stem_key(path) == lookup]
-        sloppaks = sorted((path for path in matching if path.suffix.lower() == ".sloppak"), key=lambda p: p.name.lower())
-        if sloppaks:
-            return SongMatch(sloppaks[0].relative_to(self.dlc_dir).as_posix(), "sloppak", True)
-        if manual_path and manual_path.is_file() and manual_path.suffix.lower() == ".psarc":
-            return SongMatch(manual, "psarc", False)
-        psarcs = sorted((path for path in matching if path.suffix.lower() == ".psarc"), key=_psarc_rank)
-        if psarcs:
-            return SongMatch(psarcs[0].relative_to(self.dlc_dir).as_posix(), "psarc", True)
+    def _manual_match(self, manual: str | None, package_format: str) -> SongMatch | None:
+        manual_path = self._path_in_dlc(manual) if manual else None
+        if manual_path and manual_path.is_file() and manual_path.suffix.lower() == f".{package_format}":
+            return SongMatch(manual, package_format, False)
         return None
 
     def resolve(self, song_key: str) -> SongMatch | None:
         lookup = _key(song_key)
         if not lookup:
             return None
+        self._refresh_song_index()
         with self._lock:
             manual = self._mappings.get(lookup)
-            files = list(self._files) if self._files is not None else None
-            converted_sloppaks = dict(self._converted_sloppaks)
-        if files is None:
-            self.rescan()
-            with self._lock:
-                files = list(self._files or [])
-                converted_sloppaks = dict(self._converted_sloppaks)
-        match = self._resolve_scanned(lookup, manual, files, converted_sloppaks)
-        if match:
-            return match
+            automatic = self._song_index.get(lookup) if self._song_index else None
 
-        # Pick up a newly completed conversion without requiring a manual rescan.
-        self.rescan()
+        manual_sloppak = self._manual_match(manual, "sloppak")
+        if manual_sloppak:
+            return manual_sloppak
+        if automatic and automatic.format == "sloppak":
+            return automatic
+        manual_psarc = self._manual_match(manual, "psarc")
+        if manual_psarc:
+            return manual_psarc
+        if automatic:
+            return automatic
+
+        # Force one rebuild on a miss in case a package changed while its
+        # inventory snapshot was being collected.
+        self._refresh_song_index(force=True)
         with self._lock:
-            files = list(self._files or [])
-            converted_sloppaks = dict(self._converted_sloppaks)
-        return self._resolve_scanned(lookup, manual, files, converted_sloppaks)
+            return self._song_index.get(lookup) if self._song_index else None
 
 
 def setup(app: Any, context: dict[str, Any]) -> None:

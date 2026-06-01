@@ -15,6 +15,7 @@
         deadbandMs: 70,
         songSelectionDelayMs: 750,
         showPlayerControls: true,
+        playSongCues: true,
         playResyncCue: false
     };
     let settings = loadSettings();
@@ -36,6 +37,7 @@
                 deadbandMs: Math.max(10, finiteNumber(saved.deadbandMs, defaults.deadbandMs)),
                 songSelectionDelayMs: Math.max(0, finiteNumber(saved.songSelectionDelayMs, defaults.songSelectionDelayMs)),
                 showPlayerControls: saved.showPlayerControls !== false,
+                playSongCues: saved.playSongCues !== false && saved.playReadyCue !== false,
                 playResyncCue: saved.playResyncCue === true
             };
         } catch (_) {
@@ -172,6 +174,16 @@
             input.dataset.bound = '1';
             input.addEventListener('change', () => {
                 settings.playResyncCue = input.checked;
+                saveSettings();
+            });
+        });
+        document.querySelectorAll('[data-rs-ready-cue]').forEach((input) => {
+            input.checked = settings.playSongCues;
+            if (input.dataset.bound) return;
+            input.dataset.bound = '1';
+            input.addEventListener('change', () => {
+                settings.playSongCues = input.checked;
+                if (!settings.playSongCues) stopLoadingCues(false);
                 saveSettings();
             });
         });
@@ -312,6 +324,7 @@
     }
 
     function startLoadingCues() {
+        if (!settings.playSongCues) return;
         if (hooks.loadingCueTimer) return;
         playLoadingCue();
         hooks.loadingCueTimer = setInterval(playLoadingCue, 1000);
@@ -322,7 +335,7 @@
             clearInterval(hooks.loadingCueTimer);
             hooks.loadingCueTimer = null;
         }
-        if (ready) playReadyCue();
+        if (ready && settings.playSongCues) playReadyCue();
     }
 
     function targetSeconds(state) {

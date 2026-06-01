@@ -12,6 +12,9 @@ chain.
 - For `.sloppak` files produced by Slopsmith's converter, Rocksmith Sync also
   reads the source PSARC's `DLCKey`, so CDLC can match even when its filename
   does not resemble Rocksmith's internal song key.
+- Rocksmith Sync persists a song-key index in Slopsmith's config directory.
+  The index is rebuilt automatically when DLC packages or converter jobs
+  change.
 - Slopsmith uses a `.psarc` package only when no matching `.sloppak` exists.
 - A global offset is available in milliseconds:
   - positive values make Slopsmith play ahead of Rocksmith;
@@ -21,7 +24,8 @@ chain.
   before loading it, avoiding repeated loads while browsing the song list.
 - Slopsmith waits for the selected backing audio, including all decoded
   `.sloppak` stems, before it starts playback. A short repeating synthesized
-  cue indicates loading; a different cue sounds when playback can begin.
+  cue indicates loading; an optional different cue sounds when playback can
+  begin.
 - Set Rocksmith **Song Volume** to **0** once so Slopsmith is the only
   backing-audio source, and turn **Audio Exclusivity** off so Slopsmith can
   use the audio device while Rocksmith is running.
@@ -57,9 +61,11 @@ depend on a companion RSMods DLL.
 
 ## Song Matching
 
-Most CDLC files match automatically because Rocksmith song key `foo` commonly
-uses `foo_p.psarc` or `foo_p.sloppak`. Matching ignores punctuation and usual
-arrangement suffixes.
+Most CDLC files match automatically. Rocksmith Sync indexes PSARC `DLCKey`
+metadata and also checks filenames, so Rocksmith song key `foo` can resolve to
+`foo_p.psarc`, `foo_p.sloppak`, or a differently named package produced by the
+converter. Filename matching ignores punctuation and usual arrangement
+suffixes.
 
 When a package has a different filename, open **Rocksmith Sync** and add a
 manual mapping:
@@ -81,6 +87,7 @@ Matching still prefers an automatic or manual `.sloppak` over any `.psarc`.
 | Correction threshold | `70 ms` | Seek-resync only when Slopsmith is ahead or behind Rocksmith by more than this amount. |
 | Song selection delay | `750 ms` | Wait for a stable Rocksmith selection before loading it. |
 | Show sync controls in player | On | Show the player checkbox and offset field. |
+| Play tones while song loads and when ready | On | Sound repeating loading cues and a short cue when the selected backing audio is ready. |
 | Play tone when drift correction occurs | Off | Sound a short cue when active playback is seek-corrected. |
 
 The Slopsmith player controls expose the `Rocksmith Sync` checkbox and global
