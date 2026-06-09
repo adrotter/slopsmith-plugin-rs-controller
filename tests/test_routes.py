@@ -3,7 +3,7 @@ import json
 import unittest
 from pathlib import Path
 
-from routes import SongResolver
+from routes import SongIdentity, SongResolver
 
 
 class SongResolverTests(unittest.TestCase):
@@ -45,6 +45,134 @@ class SongResolverTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match.format, "psarc")
         self.assertEqual(match.filename, "songs/knights_p.psarc")
+
+    def test_sloppak_filename_can_match_title_inside_artist_title_name(self):
+        self.touch("songs/The Cure - Boys Don't Cry.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("BoysDontCry")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/The Cure - Boys Don't Cry.sloppak")
+
+    def test_sloppak_filename_can_match_reversed_artist_title_name(self):
+        self.touch("songs/Boys Don't Cry - The Cure.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("TheCureBoysDontCry")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/Boys Don't Cry - The Cure.sloppak")
+
+    def test_sloppak_filename_can_match_compact_reversed_artist_title_name(self):
+        self.touch("songs/Boys Don't Cry-The Cure.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("TheCureBoysDontCry")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/Boys Don't Cry-The Cure.sloppak")
+
+    def test_sloppak_filename_can_match_underscored_artist_title_separator(self):
+        self.touch("songs/The_Cure_-_Boys_Don't_Cry_v1_p.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("BoysDontCry")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/The_Cure_-_Boys_Don't_Cry_v1_p.sloppak")
+
+    def test_sloppak_filename_part_can_match_short_title(self):
+        self.touch("songs/Chimney_-_Yellow_Moon_Band.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("Chimney")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/Chimney_-_Yellow_Moon_Band.sloppak")
+
+    def test_sloppak_filename_part_can_match_five_letter_title(self):
+        self.touch("songs/Breed_-_Nirvana.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("Breed")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/Breed_-_Nirvana.sloppak")
+
+    def test_sloppak_filename_part_can_match_four_letter_title(self):
+        self.touch("songs/Time_-_Pink_Floyd.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("Time")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/Time_-_Pink_Floyd.sloppak")
+
+    def test_sloppak_filename_part_can_match_three_letter_title(self):
+        self.touch("songs/Now_-_Paramore.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("Now")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/Now_-_Paramore.sloppak")
+
+    def test_ambiguous_filename_part_alias_is_ignored(self):
+        self.touch("songs/SharedTitle_-_First_Artist.sloppak")
+        self.touch("songs/SharedTitle_-_Second_Artist.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("SharedTitle")
+
+        self.assertIsNone(match)
+
+    def test_short_numeric_title_can_match_artist_title_sloppak(self):
+        self.touch("songs/Blur - Song 2.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("Song2")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/Blur - Song 2.sloppak")
+
+    def test_ambiguous_short_numeric_fuzzy_match_is_ignored(self):
+        self.touch("songs/First Artist - Song 2.sloppak")
+        self.touch("songs/Second Artist - Song 2.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("Song2")
+
+        self.assertIsNone(match)
+
+    def test_fuzzy_sloppak_beats_exact_psarc(self):
+        self.touch("songs/boysdontcry_p.psarc")
+        self.touch("songs/The Cure - Boys Don't Cry.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("BoysDontCry")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertEqual(match.filename, "songs/The Cure - Boys Don't Cry.sloppak")
+
+    def test_ambiguous_fuzzy_sloppak_match_is_ignored(self):
+        self.touch("songs/First Artist - Shared Title.sloppak")
+        self.touch("songs/Second Artist - Shared Title.sloppak")
+        self.resolver.rescan()
+
+        match = self.resolver.resolve("SharedTitle")
+
+        self.assertIsNone(match)
 
     def test_manual_mapping_handles_nonmatching_names(self):
         self.touch("custom/my-audio-name.sloppak")
@@ -100,6 +228,62 @@ class SongResolverTests(unittest.TestCase):
         self.assertEqual(match.format, "psarc")
         self.assertTrue(match.automatic)
         self.assertEqual(match.filename, "cdlc/Pink-Floyd_Have-A-Cigar_v1_p.psarc")
+
+    def test_psarc_metadata_key_can_match_sloppak_title_and_artist(self):
+        source = self.touch("songs/official_pack.psarc")
+        sloppak = self.touch("sloppak/Now_-_Paramore.sloppak")
+
+        def read_psarc_metadata(path):
+            if path == source:
+                return {"paramorenow": SongIdentity("Now", "Paramore", "Paramore")}
+            return {}
+
+        def read_sloppak_identity(path):
+            if path == sloppak:
+                return SongIdentity("Now", "Paramore", "Paramore")
+            return None
+
+        resolver = SongResolver(
+            self.dlc,
+            self.config,
+            psarc_metadata_reader=read_psarc_metadata,
+            sloppak_identity_reader=read_sloppak_identity,
+        )
+
+        match = resolver.resolve("ParamoreNow")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertTrue(match.automatic)
+        self.assertEqual(match.filename, "sloppak/Now_-_Paramore.sloppak")
+
+    def test_psarc_metadata_uses_psarc_when_sloppak_identity_is_ambiguous(self):
+        source = self.touch("songs/official_pack.psarc")
+        first = self.touch("sloppak/custom-one.sloppak")
+        second = self.touch("other/custom-two.sloppak")
+
+        def read_psarc_metadata(path):
+            if path == source:
+                return {"paramorenow": SongIdentity("Now", "Paramore", "Paramore")}
+            return {}
+
+        def read_sloppak_identity(path):
+            if path in {first, second}:
+                return SongIdentity("Now", "Paramore", "Paramore")
+            return None
+
+        resolver = SongResolver(
+            self.dlc,
+            self.config,
+            psarc_metadata_reader=read_psarc_metadata,
+            sloppak_identity_reader=read_sloppak_identity,
+        )
+
+        match = resolver.resolve("ParamoreNow")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "psarc")
+        self.assertEqual(match.filename, "songs/official_pack.psarc")
 
     def test_persisted_song_index_is_reused_after_restart(self):
         source = self.touch("cdlc/nonmatching-name_p.psarc")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,21 +15,61 @@ from typing import Any
 from rocksmith_reader import RocksmithReader
 
 PLUGIN_ID = "rocksmith_sync"
-SONG_INDEX_VERSION = 1
+SONG_INDEX_VERSION = 4
 
 
 def _key(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
 
-def _stem_key(path: Path) -> str:
-    stem = path.stem
+def _clean_stem(stem: str) -> str:
     lower = stem.lower()
     for suffix in ("_p", "_m", "_bass", "_lead", "_rhythm"):
         if lower.endswith(suffix):
             stem = stem[: -len(suffix)]
             break
-    return _key(stem)
+    return re.sub(r"(?i)(?:[ _.-]+v(?:ersion)?\d+(?:\.\d+)*)$", "", stem).strip(" _.-")
+
+
+def _stem_lookup_keys(path: Path) -> list[str]:
+    stem = _clean_stem(path.stem)
+    candidates = [stem]
+    parts = [part.strip(" _.") for part in re.split(r"\s*(?:--|-)\s*", stem) if part.strip(" _.")]
+    if len(parts) == 2:
+        candidates.append(" ".join(reversed(parts)))
+
+    keys: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = _key(candidate)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            keys.append(normalized)
+    return keys
+
+
+def _stem_part_lookup_keys(path: Path) -> list[str]:
+    stem = _clean_stem(path.stem)
+    parts = [part.strip(" _.") for part in re.split(r"\s*(?:--|-)\s*", stem) if part.strip(" _.")]
+    if len(parts) != 2:
+        return []
+
+    keys: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        normalized = _key(part)
+        if normalized and _allow_part_lookup(normalized) and normalized not in seen:
+            seen.add(normalized)
+            keys.append(normalized)
+    return keys
+
+
+def _allow_fuzzy_lookup(lookup: str) -> bool:
+    return len(lookup) >= 8 or (len(lookup) >= 4 and any(ch.isdigit() for ch in lookup))
+
+
+def _allow_part_lookup(lookup: str) -> bool:
+    return len(lookup) >= 3
 
 
 def _psarc_rank(path: Path) -> tuple[int, str]:
@@ -40,16 +81,60 @@ def _psarc_rank(path: Path) -> tuple[int, str]:
     return (1, lower)
 
 
-def _read_psarc_dlc_keys(path: Path) -> set[str]:
-    """Read Rocksmith DLC keys using Slopsmith's already-loaded PSARC parser."""
+@dataclass(frozen=True)
+class SongIdentity:
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+
+
+def _identity_lookup_keys(identity: SongIdentity) -> list[str]:
+    title = _key(identity.title)
+    artist = _key(identity.artist)
+    keys: list[str] = []
+    if title and artist:
+        keys.extend((title + artist, artist + title))
+    if title:
+        keys.append(title)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            unique.append(key)
+    return unique
+
+
+def _identity_match_keys(identity: SongIdentity) -> list[str]:
+    title = _key(identity.title)
+    artist = _key(identity.artist)
+    keys: list[str] = []
+    if title and artist:
+        keys.append(f"titleartist:{title}:{artist}")
+    if title:
+        keys.append(f"title:{title}")
+    return keys
+
+
+def _identity_from_attrs(attrs: dict[str, Any]) -> SongIdentity:
+    return SongIdentity(
+        title=str(attrs.get("SongName") or attrs.get("Title") or ""),
+        artist=str(attrs.get("ArtistName") or attrs.get("Artist") or ""),
+        album=str(attrs.get("AlbumName") or attrs.get("Album") or ""),
+    )
+
+
+def _read_psarc_song_metadata(path: Path) -> dict[str, SongIdentity]:
+    """Read Rocksmith song keys and display metadata from PSARC manifests."""
     try:
         from psarc import read_psarc_entries
 
         files = read_psarc_entries(str(path), ["*.json"])
     except Exception:
-        return set()
+        return {}
 
-    keys: set[str] = set()
+    songs: dict[str, SongIdentity] = {}
     for raw in files.values():
         try:
             entries = (json.loads(raw).get("Entries") or {}).values()
@@ -59,11 +144,34 @@ def _read_psarc_dlc_keys(path: Path) -> set[str]:
             attrs = entry.get("Attributes") if isinstance(entry, dict) else None
             if not isinstance(attrs, dict):
                 continue
-            value = attrs.get("DLCKey") or attrs.get("SongKey")
-            normalized = _key(str(value or ""))
-            if normalized:
-                keys.add(normalized)
-    return keys
+            identity = _identity_from_attrs(attrs)
+            for value in (attrs.get("DLCKey"), attrs.get("SongKey")):
+                normalized = _key(str(value or ""))
+                if normalized and (normalized not in songs or not songs[normalized].title):
+                    songs[normalized] = identity
+    return songs
+
+
+def _read_psarc_dlc_keys(path: Path) -> set[str]:
+    """Read Rocksmith DLC keys using Slopsmith's already-loaded PSARC parser."""
+    return set(_read_psarc_song_metadata(path))
+
+
+def _read_sloppak_identity(path: Path) -> SongIdentity | None:
+    try:
+        from sloppak import load_manifest
+
+        manifest = load_manifest(path)
+    except Exception:
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    identity = SongIdentity(
+        title=str(manifest.get("title") or ""),
+        artist=str(manifest.get("artist") or ""),
+        album=str(manifest.get("album") or ""),
+    )
+    return identity if identity.title or identity.artist else None
 
 
 @dataclass
@@ -79,12 +187,24 @@ class SongResolver:
         dlc_dir: Path,
         config_dir: Path,
         dlc_key_reader: Callable[[Path], set[str]] | None = None,
+        psarc_metadata_reader: Callable[[Path], dict[str, SongIdentity]] | None = None,
+        sloppak_identity_reader: Callable[[Path], SongIdentity | None] | None = None,
     ) -> None:
         self.dlc_dir = dlc_dir.resolve()
         self.config_path = config_dir / f"{PLUGIN_ID}.json"
         self.song_index_path = config_dir / f"{PLUGIN_ID}_song_index.json"
         self.converter_jobs_path = config_dir / "sloppak_converter_jobs.json"
-        self._dlc_key_reader = dlc_key_reader or _read_psarc_dlc_keys
+        if psarc_metadata_reader:
+            self._psarc_metadata_reader = psarc_metadata_reader
+        elif dlc_key_reader:
+            self._psarc_metadata_reader = lambda path: {
+                _key(value): SongIdentity()
+                for value in dlc_key_reader(path)
+                if _key(value)
+            }
+        else:
+            self._psarc_metadata_reader = _read_psarc_song_metadata
+        self._sloppak_identity_reader = sloppak_identity_reader or _read_sloppak_identity
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._song_index: dict[str, SongMatch] | None = None
@@ -225,18 +345,60 @@ class SongResolver:
 
     def _build_song_index(self, files: list[Path]) -> dict[str, SongMatch]:
         index: dict[str, SongMatch] = {}
-        psarc_keys: dict[Path, set[str]] = {}
+        weak_aliases: dict[str, SongMatch | None] = {}
+        sloppak_identities: dict[str, SongMatch | None] = {}
+        psarc_metadata: dict[Path, dict[str, SongIdentity]] = {}
+
+        def read_psarc_metadata(path: Path) -> dict[str, SongIdentity]:
+            resolved = path.resolve()
+            if resolved not in psarc_metadata:
+                psarc_metadata[resolved] = {
+                    lookup: identity
+                    for lookup, identity in self._psarc_metadata_reader(resolved).items()
+                    if _key(lookup)
+                }
+            return psarc_metadata[resolved]
 
         def read_keys(path: Path) -> set[str]:
-            resolved = path.resolve()
-            if resolved not in psarc_keys:
-                psarc_keys[resolved] = {_key(value) for value in self._dlc_key_reader(resolved) if _key(value)}
-            return psarc_keys[resolved]
+            return set(read_psarc_metadata(path))
 
         def add(lookup: str, filename: str, package_format: str) -> None:
             normalized = _key(lookup)
             if normalized:
                 index.setdefault(normalized, SongMatch(filename, package_format, True))
+
+        def add_weak(lookup: str, filename: str, package_format: str) -> None:
+            normalized = _key(lookup)
+            if not normalized or normalized in index:
+                return
+            match = SongMatch(filename, package_format, True)
+            if normalized not in weak_aliases:
+                weak_aliases[normalized] = match
+                return
+            existing = weak_aliases[normalized]
+            if existing and existing.filename == match.filename and existing.format == match.format:
+                return
+            weak_aliases[normalized] = None
+
+        def add_identity_alias(identity: SongIdentity | None, filename: str, package_format: str) -> None:
+            if not identity:
+                return
+            match = SongMatch(filename, package_format, True)
+            for alias in _identity_match_keys(identity):
+                if alias not in sloppak_identities:
+                    sloppak_identities[alias] = match
+                    continue
+                existing = sloppak_identities[alias]
+                if existing and existing.filename == match.filename and existing.format == match.format:
+                    continue
+                sloppak_identities[alias] = None
+
+        def find_identity_sloppak(identity: SongIdentity) -> SongMatch | None:
+            for alias in _identity_match_keys(identity):
+                match = sloppak_identities.get(alias)
+                if match:
+                    return match
+            return None
 
         converted_sloppaks = self._read_converted_sloppaks(read_keys)
         for lookup, filename in sorted(converted_sloppaks.items()):
@@ -247,7 +409,15 @@ class SongResolver:
             key=lambda path: path.relative_to(self.dlc_dir).as_posix().lower(),
         )
         for path in sloppaks:
-            add(_stem_key(path), path.relative_to(self.dlc_dir).as_posix(), "sloppak")
+            filename = path.relative_to(self.dlc_dir).as_posix()
+            for lookup in _stem_lookup_keys(path):
+                add(lookup, filename, "sloppak")
+            for lookup in _stem_part_lookup_keys(path):
+                add_weak(lookup, filename, "sloppak")
+            identity = self._sloppak_identity_reader(path)
+            for lookup in _identity_lookup_keys(identity or SongIdentity()):
+                add_weak(lookup, filename, "sloppak")
+            add_identity_alias(identity, filename, "sloppak")
 
         psarcs = sorted(
             (path for path in files if path.suffix.lower() == ".psarc"),
@@ -255,9 +425,21 @@ class SongResolver:
         )
         for path in psarcs:
             filename = path.relative_to(self.dlc_dir).as_posix()
-            for lookup in sorted(read_keys(path)):
+            for lookup, identity in sorted(read_psarc_metadata(path).items()):
+                sloppak_match = find_identity_sloppak(identity)
+                if sloppak_match:
+                    add(lookup, sloppak_match.filename, "sloppak")
                 add(lookup, filename, "psarc")
-            add(_stem_key(path), filename, "psarc")
+                for alias in _identity_lookup_keys(identity):
+                    add_weak(alias, filename, "psarc")
+            for lookup in _stem_lookup_keys(path):
+                add(lookup, filename, "psarc")
+            for lookup in _stem_part_lookup_keys(path):
+                add_weak(lookup, filename, "psarc")
+
+        for lookup, match in sorted(weak_aliases.items()):
+            if match and lookup not in index:
+                index[lookup] = match
         return index
 
     def _refresh_song_index(self, force: bool = False) -> int:
@@ -308,6 +490,53 @@ class SongResolver:
             return SongMatch(manual, package_format, False)
         return None
 
+    def _fuzzy_match_locked(self, lookup: str, package_format: str | None = None) -> SongMatch | None:
+        if not _allow_fuzzy_lookup(lookup) or not self._song_index:
+            return None
+
+        candidates: list[tuple[tuple[int, int, str], SongMatch]] = []
+        for indexed, match in self._song_index.items():
+            if indexed == lookup or not _allow_fuzzy_lookup(indexed):
+                continue
+            if package_format and match.format != package_format:
+                continue
+            if lookup in indexed or indexed in lookup:
+                candidates.append(((abs(len(indexed) - len(lookup)), len(indexed), indexed), match))
+        if not candidates:
+            return None
+
+        if len({match.filename for _, match in candidates}) > 1:
+            return None
+        candidates.sort(key=lambda candidate: candidate[0])
+        return candidates[0][1]
+
+    def _automatic_matches_locked(self, lookup: str) -> tuple[SongMatch | None, SongMatch | None, SongMatch | None]:
+        automatic = self._song_index.get(lookup) if self._song_index else None
+        fuzzy_sloppak = None
+        if not (automatic and automatic.format == "sloppak"):
+            fuzzy_sloppak = self._fuzzy_match_locked(lookup, "sloppak")
+        fuzzy_automatic = None if automatic else self._fuzzy_match_locked(lookup)
+        return automatic, fuzzy_sloppak, fuzzy_automatic
+
+    def _choose_match(
+        self,
+        manual: str | None,
+        automatic: SongMatch | None,
+        fuzzy_sloppak: SongMatch | None,
+        fuzzy_automatic: SongMatch | None,
+    ) -> SongMatch | None:
+        manual_sloppak = self._manual_match(manual, "sloppak")
+        if manual_sloppak:
+            return manual_sloppak
+        if automatic and automatic.format == "sloppak":
+            return automatic
+        if fuzzy_sloppak:
+            return fuzzy_sloppak
+        manual_psarc = self._manual_match(manual, "psarc")
+        if manual_psarc:
+            return manual_psarc
+        return automatic or fuzzy_automatic
+
     def resolve(self, song_key: str) -> SongMatch | None:
         lookup = _key(song_key)
         if not lookup:
@@ -315,24 +544,19 @@ class SongResolver:
         self._refresh_song_index()
         with self._lock:
             manual = self._mappings.get(lookup)
-            automatic = self._song_index.get(lookup) if self._song_index else None
+            automatic, fuzzy_sloppak, fuzzy_automatic = self._automatic_matches_locked(lookup)
 
-        manual_sloppak = self._manual_match(manual, "sloppak")
-        if manual_sloppak:
-            return manual_sloppak
-        if automatic and automatic.format == "sloppak":
-            return automatic
-        manual_psarc = self._manual_match(manual, "psarc")
-        if manual_psarc:
-            return manual_psarc
-        if automatic:
-            return automatic
+        match = self._choose_match(manual, automatic, fuzzy_sloppak, fuzzy_automatic)
+        if match:
+            return match
 
         # Force one rebuild on a miss in case a package changed while its
         # inventory snapshot was being collected.
         self._refresh_song_index(force=True)
         with self._lock:
-            return self._song_index.get(lookup) if self._song_index else None
+            manual = self._mappings.get(lookup)
+            automatic, fuzzy_sloppak, fuzzy_automatic = self._automatic_matches_locked(lookup)
+        return self._choose_match(manual, automatic, fuzzy_sloppak, fuzzy_automatic)
 
 
 def setup(app: Any, context: dict[str, Any]) -> None:

@@ -372,18 +372,40 @@
         }
     }
 
+    function normalizeSongFilename(value) {
+        let textValue = String(value || '').replace(/\\/g, '/').trim();
+        try {
+            textValue = decodeURIComponent(textValue);
+        } catch (_) {
+            // Keep the original value when it is not URI encoded.
+        }
+        return textValue.replace(/^\/+/, '').toLowerCase();
+    }
+
+    function currentSlopsmithFilenames() {
+        return [
+            window.slopsmith?.currentSong?.filename,
+            window._currentSongFile,
+            window._slopsmithSongKey
+        ].map(normalizeSongFilename).filter(Boolean);
+    }
+
+    function selectedSongLoaded() {
+        const selected = normalizeSongFilename(selectedAudio);
+        return selected && currentSlopsmithFilenames().includes(selected);
+    }
+
     function audioReadiness() {
-        const currentFilename = String(window.slopsmith?.currentSong?.filename || '');
-        if (!selectedAudio || currentFilename !== selectedAudio) {
+        if (!selectedSongLoaded()) {
             return { ready: false, status: 'Opening selected song...' };
         }
 
         const info = songInfo();
-        if (!info || !Array.isArray(info.stems)) {
+        if (!info || Object.keys(info).length === 0) {
             return { ready: false, status: 'Reading audio manifest...' };
         }
 
-        if (info.stems.length > 0 && typeof window.stems?.getState === 'function') {
+        if (Array.isArray(info.stems) && info.stems.length > 0 && typeof window.stems?.getState === 'function') {
             let decodedStems = [];
             try {
                 decodedStems = window.stems.getState() || [];
@@ -394,6 +416,10 @@
                 return { ready: true, status: `Ready (${decodedStems.length} stems)` };
             }
             return { ready: false, status: `Loading ${info.stems.length} stems...` };
+        }
+
+        if (info.audio_error && !info.audio_url) {
+            return { ready: false, status: 'Audio unavailable' };
         }
 
         if (window._juceMode === true) {
@@ -463,8 +489,8 @@
         }
 
         const generation = controlGeneration;
-        const slopsmithSelection = String(window.slopsmith?.currentSong?.filename || '');
-        const selectionWasOverridden = songReady && selectedAudio && slopsmithSelection && slopsmithSelection !== selectedAudio;
+        const hasSlopsmithSelection = currentSlopsmithFilenames().length > 0;
+        const selectionWasOverridden = songReady && selectedAudio && hasSlopsmithSelection && !selectedSongLoaded();
         if (state.songKey !== currentRocksmithSong) {
             const remainingMs = settings.songSelectionDelayMs - (Date.now() - candidateSongSince);
             if (remainingMs > 0) {
