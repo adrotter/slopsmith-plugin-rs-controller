@@ -257,6 +257,51 @@ class SongResolverTests(unittest.TestCase):
         self.assertTrue(match.automatic)
         self.assertEqual(match.filename, "sloppak/Now_-_Paramore.sloppak")
 
+    def test_base_songs_psarc_metadata_can_match_sloppak_title_and_artist(self):
+        source = self.dlc.parent / "songs.psarc"
+        source.write_bytes(b"base songs")
+        sloppak = self.touch("sloppak/Don_t_Stop_-_Crimson.sloppak")
+
+        def read_psarc_metadata(path):
+            if path == source:
+                return {"dontstop": SongIdentity("Don't Stop", "Crimson", "Crimson")}
+            return {}
+
+        def read_sloppak_identity(path):
+            if path == sloppak:
+                return SongIdentity("Don't Stop", "Crimson", "Crimson")
+            return None
+
+        resolver = SongResolver(
+            self.dlc,
+            self.config,
+            psarc_metadata_reader=read_psarc_metadata,
+            sloppak_identity_reader=read_sloppak_identity,
+        )
+
+        match = resolver.resolve("DontStop")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.format, "sloppak")
+        self.assertTrue(match.automatic)
+        self.assertEqual(match.filename, "sloppak/Don_t_Stop_-_Crimson.sloppak")
+
+    def test_base_songs_psarc_is_not_used_as_playable_fallback(self):
+        source = self.dlc.parent / "songs.psarc"
+        source.write_bytes(b"base songs")
+
+        resolver = SongResolver(
+            self.dlc,
+            self.config,
+            psarc_metadata_reader=lambda path: {
+                "dontstop": SongIdentity("Don't Stop", "Crimson", "Crimson")
+            } if path == source else {},
+        )
+
+        match = resolver.resolve("DontStop")
+
+        self.assertIsNone(match)
+
     def test_psarc_metadata_uses_psarc_when_sloppak_identity_is_ambiguous(self):
         source = self.touch("songs/official_pack.psarc")
         first = self.touch("sloppak/custom-one.sloppak")

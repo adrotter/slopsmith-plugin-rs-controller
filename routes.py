@@ -212,6 +212,23 @@ class SongResolver:
         self._file_count = 0
         self._mappings = self._read_mappings()
 
+    def _relative_dlc_filename(self, path: Path) -> str | None:
+        try:
+            return path.relative_to(self.dlc_dir).as_posix()
+        except ValueError:
+            return None
+
+    def _package_sort_key(self, path: Path) -> str:
+        return self._relative_dlc_filename(path) or path.as_posix()
+
+    def _metadata_psarcs(self) -> list[Path]:
+        candidates: list[Path] = []
+        if self.dlc_dir.name.lower() == "dlc":
+            songs_psarc = self.dlc_dir.parent / "songs.psarc"
+            if songs_psarc.is_file():
+                candidates.append(songs_psarc)
+        return candidates
+
     def _read_mappings(self) -> dict[str, str]:
         try:
             raw = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -287,6 +304,19 @@ class SongResolver:
                             "mtimeNs": stat.st_mtime_ns,
                         }
                     )
+        for path in self._metadata_psarcs():
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            files.append(path)
+            inventory.append(
+                {
+                    "path": f"metadata:{path.name}",
+                    "size": stat.st_size,
+                    "mtimeNs": stat.st_mtime_ns,
+                }
+            )
         try:
             converter_jobs_hash = hashlib.sha256(self.converter_jobs_path.read_bytes()).hexdigest()
         except OSError:
@@ -406,10 +436,12 @@ class SongResolver:
 
         sloppaks = sorted(
             (path for path in files if path.suffix.lower() == ".sloppak"),
-            key=lambda path: path.relative_to(self.dlc_dir).as_posix().lower(),
+            key=lambda path: self._package_sort_key(path).lower(),
         )
         for path in sloppaks:
-            filename = path.relative_to(self.dlc_dir).as_posix()
+            filename = self._relative_dlc_filename(path)
+            if not filename:
+                continue
             for lookup in _stem_lookup_keys(path):
                 add(lookup, filename, "sloppak")
             for lookup in _stem_part_lookup_keys(path):
@@ -421,17 +453,20 @@ class SongResolver:
 
         psarcs = sorted(
             (path for path in files if path.suffix.lower() == ".psarc"),
-            key=lambda path: (_psarc_rank(path), path.relative_to(self.dlc_dir).as_posix().lower()),
+            key=lambda path: (_psarc_rank(path), self._package_sort_key(path).lower()),
         )
         for path in psarcs:
-            filename = path.relative_to(self.dlc_dir).as_posix()
+            filename = self._relative_dlc_filename(path)
             for lookup, identity in sorted(read_psarc_metadata(path).items()):
                 sloppak_match = find_identity_sloppak(identity)
                 if sloppak_match:
                     add(lookup, sloppak_match.filename, "sloppak")
-                add(lookup, filename, "psarc")
-                for alias in _identity_lookup_keys(identity):
-                    add_weak(alias, filename, "psarc")
+                if filename:
+                    add(lookup, filename, "psarc")
+                    for alias in _identity_lookup_keys(identity):
+                        add_weak(alias, filename, "psarc")
+            if not filename:
+                continue
             for lookup in _stem_lookup_keys(path):
                 add(lookup, filename, "psarc")
             for lookup in _stem_part_lookup_keys(path):
