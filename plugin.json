@@ -1,7 +1,7 @@
 {
   "id": "rocksmith_sync",
   "name": "Rocksmith Sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Use Slopsmith Desktop as the audio engine while Rocksmith owns song selection and timing.",
   "nav": {
     "label": "Rocksmith Sync",
